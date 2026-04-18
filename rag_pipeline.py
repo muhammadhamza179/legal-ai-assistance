@@ -63,6 +63,33 @@ def parse_json_safe(text):
         return None
 
 # =========================
+# STEP 36 — QUERY EXPANSION
+# =========================
+def expand_query(query: str):
+    prompt = f"""
+You are a legal AI search optimizer.
+
+Rewrite this query into 4 versions:
+
+1. Formal legal version
+2. Simple version
+3. Keyword version
+4. Related legal terminology version
+
+Return ONLY a Python list.
+
+Query: {query}
+"""
+
+    response = llm.invoke(prompt).content
+    parsed = parse_json_safe(response)
+
+    if not parsed:
+        return [query]
+
+    return parsed if isinstance(parsed, list) else [query]
+
+# =========================
 # MULTI-SIGNAL RANKING
 # =========================
 def multi_signal_ranking(query, docs, vector_results, top_k=6):
@@ -162,18 +189,38 @@ rewritten_query = llm.invoke(
 ).content.strip()
 
 # =========================
+# STEP 36 — MULTI-QUERY RETRIEVAL
+# =========================
+expanded_queries = expand_query(rewritten_query)
+
+all_vector_results = []
+
+for q in expanded_queries:
+    results = vector_store.similarity_search(q, k=5)
+    all_vector_results.extend(results)
+
+# Deduplicate vector results
+seen = set()
+vector_results = []
+
+for doc in all_vector_results:
+    key = doc.page_content[:100]
+    if key not in seen:
+        seen.add(key)
+        vector_results.append(doc)
+
+# =========================
 # KEYWORD SEARCH
 # =========================
 def keyword_search(query, docs):
     words = query.lower().split()
     return [doc for doc in docs if any(w in doc.page_content.lower() for w in words)][:5]
 
-# =========================
-# HYBRID SEARCH
-# =========================
-vector_results = vector_store.similarity_search(rewritten_query, k=10)
 keyword_results = keyword_search(query, docs)
 
+# =========================
+# HYBRID MERGE
+# =========================
 combined_docs = vector_results + keyword_results
 
 # =========================
@@ -189,7 +236,7 @@ for doc in combined_docs:
         unique_docs.append(doc)
 
 # =========================
-# STEP 33 — MULTI SIGNAL RANKING
+# RERANKING
 # =========================
 filtered_docs = multi_signal_ranking(query, unique_docs, vector_results, top_k=6)
 
