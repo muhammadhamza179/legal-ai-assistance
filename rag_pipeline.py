@@ -70,7 +70,6 @@ def expand_query(query: str):
 You are a legal AI search optimizer.
 
 Rewrite this query into 4 versions:
-
 1. Formal legal version
 2. Simple version
 3. Keyword version
@@ -88,6 +87,13 @@ Query: {query}
         return [query]
 
     return parsed if isinstance(parsed, list) else [query]
+
+# =========================
+# STEP 37 — QUERY WEIGHTING
+# =========================
+def weight_queries(queries):
+    base_weight = 0.6
+    return [(q, base_weight / (i + 1)) for i, q in enumerate(queries)]
 
 # =========================
 # MULTI-SIGNAL RANKING
@@ -162,24 +168,11 @@ vector_store = FAISS.from_documents(docs, embedding_model)
 query = "CAN SOMEONE MAKE PRIVATE ARMY?"
 
 # =========================
-# STEP 28 — SAFE EDGE HANDLING
+# SAFE CHECKS
 # =========================
 if not query or len(query.strip()) < 5:
     print("⚠️ Query too short.")
     exit()
-
-blocked_words = ["ignore", "override", "bypass"]
-if any(word in query.lower() for word in blocked_words):
-    print("⚠️ Unsafe query detected.")
-    exit()
-
-legal_keywords = [
-    "law", "legal", "court", "constitution",
-    "rights", "act", "section", "judge"
-]
-
-if not any(word in query.lower() for word in legal_keywords):
-    print("⚠️ Warning: Query may be out of domain")
 
 # =========================
 # QUERY REWRITE
@@ -189,25 +182,35 @@ rewritten_query = llm.invoke(
 ).content.strip()
 
 # =========================
-# STEP 36 — MULTI-QUERY RETRIEVAL
+# STEP 36 + 37 — MULTI QUERY + WEIGHTED FUSION
 # =========================
 expanded_queries = expand_query(rewritten_query)
+weighted_queries = weight_queries(expanded_queries)
 
-all_vector_results = []
+doc_scores = {}
 
-for q in expanded_queries:
+for q, weight in weighted_queries:
     results = vector_store.similarity_search(q, k=5)
-    all_vector_results.extend(results)
 
-# Deduplicate vector results
-seen = set()
-vector_results = []
+    for doc in results:
+        key = doc.page_content[:120]
 
-for doc in all_vector_results:
-    key = doc.page_content[:100]
-    if key not in seen:
-        seen.add(key)
-        vector_results.append(doc)
+        if key not in doc_scores:
+            doc_scores[key] = {
+                "doc": doc,
+                "score": 0
+            }
+
+        doc_scores[key]["score"] += weight
+
+# sort fused results
+sorted_docs = sorted(
+    doc_scores.values(),
+    key=lambda x: x["score"],
+    reverse=True
+)
+
+vector_results = [item["doc"] for item in sorted_docs]
 
 # =========================
 # KEYWORD SEARCH
@@ -256,7 +259,7 @@ cleaned_docs = [
 ]
 
 # =========================
-# CONTEXT CONTROL
+# CONTEXT BUILD
 # =========================
 context = build_context_with_budget(cleaned_docs)
 
