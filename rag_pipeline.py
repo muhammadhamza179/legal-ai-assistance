@@ -46,17 +46,14 @@ def count_tokens(text, model="gpt-4.1-mini"):
     encoding = tiktoken.encoding_for_model(model)
     return len(encoding.encode(text))
 
-
 def build_context_with_budget(docs, max_tokens=3000):
     context, total = [], 0
-
     for d in docs:
         t = count_tokens(d.page_content)
         if total + t > max_tokens:
             break
         context.append(d.page_content)
         total += t
-
     return "\n\n".join(context)
 
 # =========================
@@ -102,18 +99,16 @@ Return only label.
 Query: {query}
 """
     res = llm.invoke(prompt).content.strip().upper()
-
     valid = {
         "FACTUAL",
         "LEGAL_INTERPRETATION",
         "COMPLEX_REASONING",
         "DOCUMENT_LOOKUP"
     }
-
     return res if res in valid else "LEGAL_INTERPRETATION"
 
 # =========================
-# STEP 39 — CONTEXT OPTIMIZATION ENGINE
+# STEP 39 — CONTEXT OPTIMIZATION
 # =========================
 def optimize_context(docs):
     seen = set()
@@ -121,17 +116,14 @@ def optimize_context(docs):
 
     for d in docs:
         text = " ".join(d.page_content.split())
-
         sentences = text.split(". ")
         cleaned = []
 
         for s in sentences:
-            s = s.strip().lower()
-
-            if s in seen:
+            s_clean = s.strip().lower()
+            if s_clean in seen:
                 continue
-
-            seen.add(s)
+            seen.add(s_clean)
             cleaned.append(s)
 
         if cleaned:
@@ -143,6 +135,44 @@ def optimize_context(docs):
             )
 
     return optimized
+
+# =========================
+# STEP 40 — RETRIEVAL ANALYZER
+# =========================
+def analyze_retrieval(query, vector_results, keyword_results, expanded_queries):
+    report = {}
+
+    report["vector_results"] = len(vector_results)
+    report["keyword_results"] = len(keyword_results)
+    report["expanded_queries"] = len(expanded_queries)
+
+    vector_set = set([d.page_content[:100] for d in vector_results])
+    keyword_set = set([d.page_content[:100] for d in keyword_results])
+
+    report["overlap"] = len(vector_set.intersection(keyword_set))
+
+    combined = vector_results + keyword_results
+    unique = set([d.page_content[:120] for d in combined])
+
+    report["diversity"] = len(unique) / len(combined) if combined else 0
+
+    warnings = []
+
+    if len(vector_results) == 0:
+        warnings.append("Vector retrieval failed")
+
+    if len(keyword_results) == 0:
+        warnings.append("Keyword retrieval weak")
+
+    if report["diversity"] < 0.5:
+        warnings.append("Low diversity")
+
+    if report["overlap"] == 0:
+        warnings.append("No agreement between methods")
+
+    report["warnings"] = warnings
+
+    return report
 
 # =========================
 # MULTI-SIGNAL RERANKING
@@ -166,7 +196,6 @@ def multi_signal_ranking(query, docs, vector_results, top_k=6):
         semantic_score = semantic.get(doc.page_content, 0)
 
         final = 0.5 * r + 0.3 * keyword + 0.2 * semantic_score
-
         scored.append((doc, final))
 
     scored.sort(key=lambda x: x[1], reverse=True)
@@ -194,11 +223,7 @@ for file in os.listdir(folder):
 # =========================
 # CHUNKING
 # =========================
-splitter = RecursiveCharacterTextSplitter(
-    chunk_size=500,
-    chunk_overlap=50
-)
-
+splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
 docs = splitter.split_documents(documents)
 
 # =========================
@@ -211,34 +236,23 @@ vector_store = FAISS.from_documents(docs, embedding_model)
 # =========================
 query = "CAN SOMEONE MAKE PRIVATE ARMY?"
 
-# =========================
-# REWRITE
-# =========================
 rewritten_query = llm.invoke(
     f"Rewrite for legal retrieval:\n{query}"
 ).content.strip()
 
 # =========================
-# STEP 38 — INTENT ROUTING
+# INTENT
 # =========================
 intent = classify_intent(query)
 print(f"\n🔎 INTENT: {intent}\n")
 
+# =========================
+# RETRIEVAL
+# =========================
+expanded = []
 vector_results = []
-keyword_results = []
 
-# =========================
-# ROUTING ENGINE
-# =========================
-
-if intent == "DOCUMENT_LOOKUP":
-    vector_results = vector_store.similarity_search(query, k=3)
-
-elif intent == "FACTUAL":
-    vector_results = vector_store.similarity_search(query, k=5)
-
-elif intent in ["LEGAL_INTERPRETATION", "COMPLEX_REASONING"]:
-
+if intent in ["LEGAL_INTERPRETATION", "COMPLEX_REASONING"]:
     expanded = expand_query(rewritten_query)
     weighted = weight_queries(expanded)
 
@@ -249,14 +263,15 @@ elif intent in ["LEGAL_INTERPRETATION", "COMPLEX_REASONING"]:
 
         for d in results:
             key = d.page_content[:120]
-
             if key not in score_map:
                 score_map[key] = {"doc": d, "score": 0}
-
             score_map[key]["score"] += w
 
     sorted_docs = sorted(score_map.values(), key=lambda x: x["score"], reverse=True)
     vector_results = [x["doc"] for x in sorted_docs]
+
+else:
+    vector_results = vector_store.similarity_search(query, k=5)
 
 # =========================
 # KEYWORD SEARCH
@@ -266,6 +281,19 @@ def keyword_search(query, docs):
     return [d for d in docs if any(w in d.page_content.lower() for w in words)][:5]
 
 keyword_results = keyword_search(query, docs)
+
+# =========================
+# STEP 40 — ANALYSIS
+# =========================
+analysis = analyze_retrieval(
+    query,
+    vector_results,
+    keyword_results,
+    expanded if expanded else [query]
+)
+
+print("\n🔍 RETRIEVAL ANALYSIS:")
+print(json.dumps(analysis, indent=2))
 
 # =========================
 # MERGE + DEDUP
@@ -282,15 +310,12 @@ for d in combined:
         unique_docs.append(d)
 
 # =========================
-# STEP 39 — CONTEXT OPTIMIZATION
+# OPTIMIZE + CLEAN
 # =========================
 optimized_docs = optimize_context(unique_docs)
 
-def clean(text):
-    return " ".join(text.split())[:500]
-
 final_docs = [
-    Document(page_content=clean(d.page_content), metadata=d.metadata)
+    Document(page_content=" ".join(d.page_content.split())[:500], metadata=d.metadata)
     for d in optimized_docs
 ]
 
