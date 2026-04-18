@@ -3,6 +3,7 @@ import json
 import re
 import tiktoken
 from sentence_transformers import CrossEncoder
+from rank_bm25 import BM25Okapi
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
@@ -133,7 +134,6 @@ def optimize_context(docs):
                     metadata=d.metadata
                 )
             )
-
     return optimized
 
 # =========================
@@ -143,7 +143,7 @@ def analyze_retrieval(query, vector_results, keyword_results, expanded_queries):
     report = {}
 
     report["vector_results"] = len(vector_results)
-    report["keyword_results"] = len(keyword_results)
+    report["bm25_results"] = len(keyword_results)
     report["expanded_queries"] = len(expanded_queries)
 
     vector_set = set([d.page_content[:100] for d in vector_results])
@@ -162,7 +162,7 @@ def analyze_retrieval(query, vector_results, keyword_results, expanded_queries):
         warnings.append("Vector retrieval failed")
 
     if len(keyword_results) == 0:
-        warnings.append("Keyword retrieval weak")
+        warnings.append("BM25 retrieval weak")
 
     if report["diversity"] < 0.5:
         warnings.append("Low diversity")
@@ -232,6 +232,21 @@ docs = splitter.split_documents(documents)
 vector_store = FAISS.from_documents(docs, embedding_model)
 
 # =========================
+# STEP 41 — BM25 INDEX
+# =========================
+tokenized_corpus = [doc.page_content.lower().split() for doc in docs]
+bm25 = BM25Okapi(tokenized_corpus)
+
+def bm25_search(query, docs, bm25, top_k=5):
+    tokens = query.lower().split()
+    scores = bm25.get_scores(tokens)
+
+    scored = list(zip(docs, scores))
+    scored.sort(key=lambda x: x[1], reverse=True)
+
+    return [doc for doc, _ in scored[:top_k]]
+
+# =========================
 # USER QUERY
 # =========================
 query = "CAN SOMEONE MAKE PRIVATE ARMY?"
@@ -247,7 +262,7 @@ intent = classify_intent(query)
 print(f"\n🔎 INTENT: {intent}\n")
 
 # =========================
-# RETRIEVAL
+# VECTOR RETRIEVAL
 # =========================
 expanded = []
 vector_results = []
@@ -274,13 +289,9 @@ else:
     vector_results = vector_store.similarity_search(query, k=5)
 
 # =========================
-# KEYWORD SEARCH
+# BM25 SEARCH
 # =========================
-def keyword_search(query, docs):
-    words = query.lower().split()
-    return [d for d in docs if any(w in d.page_content.lower() for w in words)][:5]
-
-keyword_results = keyword_search(query, docs)
+bm25_results = bm25_search(query, docs, bm25)
 
 # =========================
 # STEP 40 — ANALYSIS
@@ -288,7 +299,7 @@ keyword_results = keyword_search(query, docs)
 analysis = analyze_retrieval(
     query,
     vector_results,
-    keyword_results,
+    bm25_results,
     expanded if expanded else [query]
 )
 
@@ -298,7 +309,7 @@ print(json.dumps(analysis, indent=2))
 # =========================
 # MERGE + DEDUP
 # =========================
-combined = vector_results + keyword_results
+combined = vector_results + bm25_results
 
 seen = set()
 unique_docs = []
@@ -310,7 +321,7 @@ for d in combined:
         unique_docs.append(d)
 
 # =========================
-# OPTIMIZE + CLEAN
+# CONTEXT OPTIMIZATION
 # =========================
 optimized_docs = optimize_context(unique_docs)
 
