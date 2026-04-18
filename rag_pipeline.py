@@ -139,40 +139,56 @@ def optimize_context(docs):
 # =========================
 # STEP 40 — RETRIEVAL ANALYZER
 # =========================
-def analyze_retrieval(query, vector_results, keyword_results, expanded_queries):
-    report = {}
+def analyze_retrieval(query, vector_results, bm25_results, expanded_queries):
+    report = {
+        "vector_results": len(vector_results),
+        "bm25_results": len(bm25_results),
+        "expanded_queries": len(expanded_queries)
+    }
 
-    report["vector_results"] = len(vector_results)
-    report["bm25_results"] = len(keyword_results)
-    report["expanded_queries"] = len(expanded_queries)
+    vset = set([d.page_content[:100] for d in vector_results])
+    bset = set([d.page_content[:100] for d in bm25_results])
 
-    vector_set = set([d.page_content[:100] for d in vector_results])
-    keyword_set = set([d.page_content[:100] for d in keyword_results])
+    report["overlap"] = len(vset.intersection(bset))
 
-    report["overlap"] = len(vector_set.intersection(keyword_set))
-
-    combined = vector_results + keyword_results
+    combined = vector_results + bm25_results
     unique = set([d.page_content[:120] for d in combined])
 
     report["diversity"] = len(unique) / len(combined) if combined else 0
 
     warnings = []
-
-    if len(vector_results) == 0:
+    if not vector_results:
         warnings.append("Vector retrieval failed")
-
-    if len(keyword_results) == 0:
-        warnings.append("BM25 retrieval weak")
-
+    if not bm25_results:
+        warnings.append("BM25 weak")
     if report["diversity"] < 0.5:
         warnings.append("Low diversity")
-
     if report["overlap"] == 0:
-        warnings.append("No agreement between methods")
+        warnings.append("No agreement")
 
     report["warnings"] = warnings
-
     return report
+
+# =========================
+# STEP 42 — SIMPLE HYBRID FUSION
+# =========================
+def hybrid_fusion_simple(vector_results, bm25_results, alpha=0.6, top_k=10):
+    scores = {}
+
+    for i, doc in enumerate(vector_results):
+        key = doc.page_content[:120]
+        scores[key] = scores.get(key, 0) + alpha * (1 - i / len(vector_results))
+
+    for i, doc in enumerate(bm25_results):
+        key = doc.page_content[:120]
+        scores[key] = scores.get(key, 0) + (1 - alpha) * (1 - i / len(bm25_results))
+
+    doc_map = {}
+    for d in vector_results + bm25_results:
+        doc_map[d.page_content[:120]] = d
+
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    return [doc_map[k] for k, _ in ranked[:top_k]]
 
 # =========================
 # MULTI-SIGNAL RERANKING
@@ -187,7 +203,6 @@ def multi_signal_ranking(query, docs, vector_results, top_k=6):
     rerank_scores = reranker.predict(pairs)
 
     scored = []
-
     for doc, r in zip(docs, rerank_scores):
         words = query.lower().split()
         text = doc.page_content.lower()
@@ -255,9 +270,6 @@ rewritten_query = llm.invoke(
     f"Rewrite for legal retrieval:\n{query}"
 ).content.strip()
 
-# =========================
-# INTENT
-# =========================
 intent = classify_intent(query)
 print(f"\n🔎 INTENT: {intent}\n")
 
@@ -272,10 +284,8 @@ if intent in ["LEGAL_INTERPRETATION", "COMPLEX_REASONING"]:
     weighted = weight_queries(expanded)
 
     score_map = {}
-
     for q, w in weighted:
         results = vector_store.similarity_search(q, k=5)
-
         for d in results:
             key = d.page_content[:120]
             if key not in score_map:
@@ -284,7 +294,6 @@ if intent in ["LEGAL_INTERPRETATION", "COMPLEX_REASONING"]:
 
     sorted_docs = sorted(score_map.values(), key=lambda x: x["score"], reverse=True)
     vector_results = [x["doc"] for x in sorted_docs]
-
 else:
     vector_results = vector_store.similarity_search(query, k=5)
 
@@ -296,29 +305,14 @@ bm25_results = bm25_search(query, docs, bm25)
 # =========================
 # STEP 40 — ANALYSIS
 # =========================
-analysis = analyze_retrieval(
-    query,
-    vector_results,
-    bm25_results,
-    expanded if expanded else [query]
-)
-
+analysis = analyze_retrieval(query, vector_results, bm25_results, expanded if expanded else [query])
 print("\n🔍 RETRIEVAL ANALYSIS:")
 print(json.dumps(analysis, indent=2))
 
 # =========================
-# MERGE + DEDUP
+# STEP 42 — HYBRID FUSION
 # =========================
-combined = vector_results + bm25_results
-
-seen = set()
-unique_docs = []
-
-for d in combined:
-    key = d.page_content[:100]
-    if key not in seen:
-        seen.add(key)
-        unique_docs.append(d)
+unique_docs = hybrid_fusion_simple(vector_results, bm25_results)
 
 # =========================
 # CONTEXT OPTIMIZATION
@@ -358,9 +352,6 @@ QUESTION:
 {query}
 """
 
-# =========================
-# RESPONSE
-# =========================
 response = llm.invoke(prompt)
 
 print("\nFINAL ANSWER:\n")
