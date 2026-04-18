@@ -64,7 +64,7 @@ def build_context_with_budget(docs, max_tokens=3000):
 # =========================
 def expand_query(query):
     prompt = f"""
-Rewrite into 4 search variations:
+Rewrite into 4 versions:
 1. Formal legal
 2. Simple
 3. Keyword
@@ -86,11 +86,11 @@ def weight_queries(queries):
     return [(q, base / (i + 1)) for i, q in enumerate(queries)]
 
 # =========================
-# STEP 38 — INTENT CLASSIFICATION
+# STEP 38 — INTENT CLASSIFIER
 # =========================
 def classify_intent(query):
     prompt = f"""
-Classify query into one:
+Classify into:
 
 FACTUAL
 LEGAL_INTERPRETATION
@@ -113,6 +113,38 @@ Query: {query}
     return res if res in valid else "LEGAL_INTERPRETATION"
 
 # =========================
+# STEP 39 — CONTEXT OPTIMIZATION ENGINE
+# =========================
+def optimize_context(docs):
+    seen = set()
+    optimized = []
+
+    for d in docs:
+        text = " ".join(d.page_content.split())
+
+        sentences = text.split(". ")
+        cleaned = []
+
+        for s in sentences:
+            s = s.strip().lower()
+
+            if s in seen:
+                continue
+
+            seen.add(s)
+            cleaned.append(s)
+
+        if cleaned:
+            optimized.append(
+                Document(
+                    page_content=". ".join(cleaned),
+                    metadata=d.metadata
+                )
+            )
+
+    return optimized
+
+# =========================
 # MULTI-SIGNAL RERANKING
 # =========================
 def multi_signal_ranking(query, docs, vector_results, top_k=6):
@@ -127,8 +159,8 @@ def multi_signal_ranking(query, docs, vector_results, top_k=6):
     scored = []
 
     for doc, r in zip(docs, rerank_scores):
-        text = doc.page_content.lower()
         words = query.lower().split()
+        text = doc.page_content.lower()
 
         keyword = sum(w in text for w in words) / len(words)
         semantic_score = semantic.get(doc.page_content, 0)
@@ -180,7 +212,7 @@ vector_store = FAISS.from_documents(docs, embedding_model)
 query = "CAN SOMEONE MAKE PRIVATE ARMY?"
 
 # =========================
-# QUERY REWRITE
+# REWRITE
 # =========================
 rewritten_query = llm.invoke(
     f"Rewrite for legal retrieval:\n{query}"
@@ -192,24 +224,20 @@ rewritten_query = llm.invoke(
 intent = classify_intent(query)
 print(f"\n🔎 INTENT: {intent}\n")
 
+vector_results = []
+keyword_results = []
+
 # =========================
 # ROUTING ENGINE
 # =========================
 
-vector_results = []
-keyword_results = []
-
-# ---------- DOCUMENT LOOKUP ----------
 if intent == "DOCUMENT_LOOKUP":
     vector_results = vector_store.similarity_search(query, k=3)
-    keyword_results = []
 
-# ---------- FACTUAL ----------
 elif intent == "FACTUAL":
     vector_results = vector_store.similarity_search(query, k=5)
 
-# ---------- LEGAL INTERPRETATION ----------
-elif intent == "LEGAL_INTERPRETATION":
+elif intent in ["LEGAL_INTERPRETATION", "COMPLEX_REASONING"]:
 
     expanded = expand_query(rewritten_query)
     weighted = weight_queries(expanded)
@@ -221,28 +249,10 @@ elif intent == "LEGAL_INTERPRETATION":
 
         for d in results:
             key = d.page_content[:120]
+
             if key not in score_map:
                 score_map[key] = {"doc": d, "score": 0}
-            score_map[key]["score"] += w
 
-    sorted_docs = sorted(score_map.values(), key=lambda x: x["score"], reverse=True)
-    vector_results = [x["doc"] for x in sorted_docs]
-
-# ---------- COMPLEX REASONING ----------
-elif intent == "COMPLEX_REASONING":
-
-    expanded = expand_query(rewritten_query)
-    weighted = weight_queries(expanded)
-
-    score_map = {}
-
-    for q, w in weighted:
-        results = vector_store.similarity_search(q, k=5)
-
-        for d in results:
-            key = d.page_content[:120]
-            if key not in score_map:
-                score_map[key] = {"doc": d, "score": 0}
             score_map[key]["score"] += w
 
     sorted_docs = sorted(score_map.values(), key=lambda x: x["score"], reverse=True)
@@ -272,12 +282,25 @@ for d in combined:
         unique_docs.append(d)
 
 # =========================
-# RERANK
+# STEP 39 — CONTEXT OPTIMIZATION
 # =========================
-final_docs = multi_signal_ranking(query, unique_docs, vector_results)
+optimized_docs = optimize_context(unique_docs)
+
+def clean(text):
+    return " ".join(text.split())[:500]
+
+final_docs = [
+    Document(page_content=clean(d.page_content), metadata=d.metadata)
+    for d in optimized_docs
+]
 
 # =========================
-# CONTEXT BUILD
+# RERANK
+# =========================
+final_docs = multi_signal_ranking(query, final_docs, vector_results)
+
+# =========================
+# CONTEXT
 # =========================
 context = build_context_with_budget(final_docs)
 
@@ -290,7 +313,7 @@ You are a strict legal AI assistant.
 RULES:
 - Only use context
 - No hallucination
-- Each statement must cite source
+- Must cite sources
 
 CONTEXT:
 {context}
@@ -300,8 +323,9 @@ QUESTION:
 """
 
 # =========================
-# LLM ANSWER
+# RESPONSE
 # =========================
 response = llm.invoke(prompt)
-print("\nFINAL RESPONSE:\n")
+
+print("\nFINAL ANSWER:\n")
 print(response.content)
