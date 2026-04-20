@@ -2,6 +2,9 @@ import os
 import json
 import re
 import tiktoken
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+
 from sentence_transformers import CrossEncoder
 from rank_bm25 import BM25Okapi
 
@@ -27,14 +30,12 @@ def count_tokens(text):
 
 def build_context(docs, max_tokens=3000):
     context, total = [], 0
-
     for doc in docs:
         t = count_tokens(doc.page_content)
         if total + t > max_tokens:
             break
         context.append(doc.page_content)
         total += t
-
     return "\n\n".join(context)
 
 # =========================
@@ -44,7 +45,7 @@ def rewrite_query(query):
     return llm.invoke(f"Rewrite for legal retrieval:\n{query}").content.strip()
 
 # =========================
-# INTENT CLASSIFIER (Step 38)
+# INTENT CLASSIFIER
 # =========================
 def classify_intent(query):
     prompt = f"""
@@ -52,32 +53,28 @@ Classify query into:
 FACTUAL, LEGAL_INTERPRETATION, COMPLEX_REASONING, DOCUMENT_LOOKUP
 
 Query: {query}
-
 Return only one label.
 """
-    result = llm.invoke(prompt).content.strip().upper()
-
+    res = llm.invoke(prompt).content.strip().upper()
     valid = {
         "FACTUAL",
         "LEGAL_INTERPRETATION",
         "COMPLEX_REASONING",
         "DOCUMENT_LOOKUP"
     }
-
-    return result if result in valid else "LEGAL_INTERPRETATION"
+    return res if res in valid else "LEGAL_INTERPRETATION"
 
 # =========================
-# BM25 SEARCH (Step 41)
+# BM25 SEARCH
 # =========================
 def bm25_search(query, docs, bm25, k=5):
     tokens = query.lower().split()
     scores = bm25.get_scores(tokens)
-
     ranked = sorted(zip(docs, scores), key=lambda x: x[1], reverse=True)
-    return [doc for doc, _ in ranked[:k]]
+    return [d for d, _ in ranked[:k]]
 
 # =========================
-# HYBRID RETRIEVAL (Step 42)
+# HYBRID RETRIEVAL
 # =========================
 def hybrid_retrieval(vector_results, bm25_results, alpha=0.6, top_k=10):
     scores = {}
@@ -100,7 +97,7 @@ def hybrid_retrieval(vector_results, bm25_results, alpha=0.6, top_k=10):
     return [doc_map[k] for k, _ in ranked[:top_k]]
 
 # =========================
-# QUERY ROUTING (Step 43)
+# QUERY ROUTING
 # =========================
 def route_query(intent, query, vector_store, docs, bm25):
 
@@ -122,23 +119,31 @@ def route_query(intent, query, vector_store, docs, bm25):
     return vector_results, bm25_results, expanded_query
 
 # =========================
-# STEP 44 — HALLUCINATION DETECTION
+# STEP 44 — KEYWORD VALIDATION
 # =========================
 def detect_hallucination(answer, context_docs, threshold=0.3):
-
-    if not answer or not context_docs:
-        return True, 0.0
-
     context_text = " ".join([doc.page_content for doc in context_docs])
-
     answer_words = set(answer.lower().split())
     context_words = set(context_text.lower().split())
 
     overlap = answer_words.intersection(context_words)
-
     score = len(overlap) / max(len(answer_words), 1)
 
     return score < threshold, score
+
+# =========================
+# STEP 45 — SEMANTIC GROUNDING
+# =========================
+def semantic_grounding(answer, context_docs, embedding_model, threshold=0.75):
+
+    context_text = " ".join([doc.page_content for doc in context_docs])
+
+    answer_emb = embedding_model.embed_query(answer)
+    context_emb = embedding_model.embed_query(context_text)
+
+    similarity = cosine_similarity([answer_emb], [context_emb])[0][0]
+
+    return similarity >= threshold, similarity
 
 # =========================
 # LOAD DOCUMENTS
@@ -149,10 +154,8 @@ documents = []
 for file in os.listdir(folder):
     if file.endswith(".pdf"):
         reader = PdfReader(f"{folder}/{file}")
-
         for i, page in enumerate(reader.pages):
             text = page.extract_text()
-
             if text:
                 documents.append(
                     Document(
@@ -187,16 +190,13 @@ bm25 = BM25Okapi(tokenized_docs)
 query = "CAN SOMEONE MAKE PRIVATE ARMY?"
 
 # =========================
-# PIPELINE START
+# PIPELINE
 # =========================
 rewritten_query = rewrite_query(query)
 intent = classify_intent(rewritten_query)
 
-print("\n🔎 INTENT:", intent)
+print("\nINTENT:", intent)
 
-# =========================
-# ROUTING
-# =========================
 vector_results, bm25_results, expanded_query = route_query(
     intent,
     rewritten_query,
@@ -205,15 +205,15 @@ vector_results, bm25_results, expanded_query = route_query(
     bm25
 )
 
-print("\n🧠 EXPANDED QUERY:", expanded_query)
+print("\nEXPANDED QUERY:", expanded_query)
 
 # =========================
-# HYBRID RETRIEVAL
+# RETRIEVAL
 # =========================
 final_docs = hybrid_retrieval(vector_results, bm25_results)
 
 # =========================
-# CONTEXT BUILDING
+# CONTEXT
 # =========================
 context = build_context(final_docs)
 
@@ -224,7 +224,7 @@ prompt = f"""
 You are a strict legal AI assistant.
 
 RULES:
-- Use only given context
+- Use only context
 - Do not hallucinate
 - Be precise
 
@@ -242,19 +242,25 @@ response = llm.invoke(prompt)
 answer = response.content
 
 # =========================
-# STEP 44 — HALLUCINATION CHECK
+# VALIDATION (STEP 44 + 45)
 # =========================
-is_hallucinated, score = detect_hallucination(answer, final_docs)
+is_hallucinated, keyword_score = detect_hallucination(answer, final_docs)
+is_grounded, semantic_score = semantic_grounding(answer, final_docs, embedding_model)
 
-print("\n🔍 HALLUCINATION SCORE:", round(score, 3))
+print("\nVALIDATION:")
+print("Keyword Score:", round(keyword_score, 3))
+print("Semantic Score:", round(semantic_score, 3))
 
 # =========================
-# FINAL OUTPUT CONTROL
+# FINAL DECISION
 # =========================
-if is_hallucinated:
-    print("\n⚠️ POSSIBLE HALLUCINATION DETECTED\n")
+if is_hallucinated or not is_grounded:
+
+    print("\n⚠️ ANSWER NOT RELIABLE\n")
+
     print("SAFE RESPONSE:\n")
-    print("The available documents do not contain enough verified information to answer this reliably.")
+    print("The retrieved documents do not provide sufficient verified information.")
+
 else:
     print("\nFINAL ANSWER:\n")
     print(answer)
