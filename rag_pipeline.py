@@ -1,8 +1,6 @@
 import os
 import json
-import re
 import tiktoken
-import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 
 from sentence_transformers import CrossEncoder
@@ -17,9 +15,9 @@ from pypdf import PdfReader
 # =========================
 # MODELS
 # =========================
-reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 llm = ChatOpenAI(model="gpt-4.1-mini")
 embedding_model = OpenAIEmbeddings()
+reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
 # =========================
 # TOKEN CONTROL
@@ -30,130 +28,156 @@ def count_tokens(text):
 
 def build_context(docs, max_tokens=3000):
     context, total = [], 0
-    for doc in docs:
-        t = count_tokens(doc.page_content)
+    for d in docs:
+        t = count_tokens(d.page_content)
         if total + t > max_tokens:
             break
-        context.append(doc.page_content)
+        context.append(d.page_content)
         total += t
     return "\n\n".join(context)
 
 # =========================
 # QUERY REWRITE
 # =========================
-def rewrite_query(query):
-    return llm.invoke(f"Rewrite for legal retrieval:\n{query}").content.strip()
+def rewrite_query(q):
+    return llm.invoke(f"Rewrite for legal retrieval:\n{q}").content.strip()
 
 # =========================
 # INTENT CLASSIFIER
 # =========================
-def classify_intent(query):
+def classify_intent(q):
     prompt = f"""
 Classify query into:
 FACTUAL, LEGAL_INTERPRETATION, COMPLEX_REASONING, DOCUMENT_LOOKUP
-
-Query: {query}
-Return only one label.
+Query: {q}
+Return only label.
 """
     res = llm.invoke(prompt).content.strip().upper()
-    valid = {
+    return res if res in {
         "FACTUAL",
         "LEGAL_INTERPRETATION",
         "COMPLEX_REASONING",
         "DOCUMENT_LOOKUP"
-    }
-    return res if res in valid else "LEGAL_INTERPRETATION"
+    } else "LEGAL_INTERPRETATION"
 
 # =========================
 # BM25 SEARCH
 # =========================
 def bm25_search(query, docs, bm25, k=5):
-    tokens = query.lower().split()
-    scores = bm25.get_scores(tokens)
+    scores = bm25.get_scores(query.lower().split())
     ranked = sorted(zip(docs, scores), key=lambda x: x[1], reverse=True)
     return [d for d, _ in ranked[:k]]
 
 # =========================
 # HYBRID RETRIEVAL
 # =========================
-def hybrid_retrieval(vector_results, bm25_results, alpha=0.6, top_k=10):
-    scores = {}
-    doc_map = {}
+def hybrid_retrieval(v, b, alpha=0.6, top_k=10):
+    scores, doc_map = {}, {}
 
-    def norm(i, size):
-        return 1 - (i / max(size, 1))
+    def norm(i, n): return 1 - (i / max(n, 1))
 
-    for i, doc in enumerate(vector_results):
-        key = doc.page_content[:120]
-        scores[key] = scores.get(key, 0) + alpha * norm(i, len(vector_results))
-        doc_map[key] = doc
+    for i, d in enumerate(v):
+        k = d.page_content[:120]
+        scores[k] = scores.get(k, 0) + alpha * norm(i, len(v))
+        doc_map[k] = d
 
-    for i, doc in enumerate(bm25_results):
-        key = doc.page_content[:120]
-        scores[key] = scores.get(key, 0) + (1 - alpha) * norm(i, len(bm25_results))
-        doc_map[key] = doc
+    for i, d in enumerate(b):
+        k = d.page_content[:120]
+        scores[k] = scores.get(k, 0) + (1 - alpha) * norm(i, len(b))
+        doc_map[k] = d
 
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     return [doc_map[k] for k, _ in ranked[:top_k]]
 
 # =========================
-# QUERY ROUTING
+# ROUTING (STEP 43)
 # =========================
 def route_query(intent, query, vector_store, docs, bm25):
 
-    expanded_query = None
-
     if intent == "FACTUAL":
-        vector_results = vector_store.similarity_search(query, k=5)
-        bm25_results = []
+        return vector_store.similarity_search(query, k=5), [], None
 
-    elif intent == "DOCUMENT_LOOKUP":
-        vector_results = vector_store.similarity_search(query, k=5)
-        bm25_results = bm25_search(query, docs, bm25)
+    if intent == "DOCUMENT_LOOKUP":
+        return (
+            vector_store.similarity_search(query, k=5),
+            bm25_search(query, docs, bm25),
+            None
+        )
 
-    else:
-        expanded_query = rewrite_query(query)
-        vector_results = vector_store.similarity_search(expanded_query, k=5)
-        bm25_results = bm25_search(query, docs, bm25)
+    expanded = rewrite_query(query)
 
-    return vector_results, bm25_results, expanded_query
+    return (
+        vector_store.similarity_search(expanded, k=5),
+        bm25_search(query, docs, bm25),
+        expanded
+    )
 
 # =========================
-# STEP 44 — KEYWORD VALIDATION
+# VALIDATION (STEP 44)
 # =========================
-def detect_hallucination(answer, context_docs, threshold=0.3):
-    context_text = " ".join([doc.page_content for doc in context_docs])
-    answer_words = set(answer.lower().split())
-    context_words = set(context_text.lower().split())
-
-    overlap = answer_words.intersection(context_words)
-    score = len(overlap) / max(len(answer_words), 1)
-
-    return score < threshold, score
+def keyword_check(answer, docs):
+    ctx = " ".join([d.page_content for d in docs])
+    a = set(answer.lower().split())
+    c = set(ctx.lower().split())
+    return len(a & c) / max(len(a), 1)
 
 # =========================
 # STEP 45 — SEMANTIC GROUNDING
 # =========================
-def semantic_grounding(answer, context_docs, embedding_model, threshold=0.75):
-
-    context_text = " ".join([doc.page_content for doc in context_docs])
-
-    answer_emb = embedding_model.embed_query(answer)
-    context_emb = embedding_model.embed_query(context_text)
-
-    similarity = cosine_similarity([answer_emb], [context_emb])[0][0]
-
-    return similarity >= threshold, similarity
+def semantic_check(answer, docs, emb):
+    ctx = " ".join([d.page_content for d in docs])
+    a_emb = emb.embed_query(answer)
+    c_emb = emb.embed_query(ctx)
+    return cosine_similarity([a_emb], [c_emb])[0][0]
 
 # =========================
-# LOAD DOCUMENTS
+# STEP 46 — CONFIDENCE
 # =========================
-folder = "data"
+def compute_confidence(k, s, docs):
+    retrieval = min(len(docs) / 10, 1)
+    return round(0.3*k + 0.5*s + 0.2*retrieval, 3)
+
+# =========================
+# STEP 47 — STRUCTURED OUTPUT + CITATIONS
+# =========================
+def format_answer_with_citations(answer, docs):
+
+    structured_prompt = f"""
+Convert into structured legal output.
+
+RULES:
+- Use ONLY provided answer
+- Attach citations from context
+- Return JSON ONLY
+
+FORMAT:
+{{
+  "answer": [
+    {{
+      "statement": "...",
+      "source": {{
+        "file": "...",
+        "page": "..."
+      }}
+    }}
+  ]
+}}
+
+ANSWER:
+{answer}
+"""
+
+    structured = llm.invoke(structured_prompt).content
+    return structured
+
+# =========================
+# LOAD DATA
+# =========================
 documents = []
 
-for file in os.listdir(folder):
+for file in os.listdir("data"):
     if file.endswith(".pdf"):
-        reader = PdfReader(f"{folder}/{file}")
+        reader = PdfReader(f"data/{file}")
         for i, page in enumerate(reader.pages):
             text = page.extract_text()
             if text:
@@ -165,68 +189,38 @@ for file in os.listdir(folder):
                 )
 
 # =========================
-# CHUNKING
+# PREPROCESS
 # =========================
-splitter = RecursiveCharacterTextSplitter(
-    chunk_size=500,
-    chunk_overlap=50
-)
+splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
 docs = splitter.split_documents(documents)
 
-# =========================
-# VECTOR STORE
-# =========================
 vector_store = FAISS.from_documents(docs, embedding_model)
+bm25 = BM25Okapi([d.page_content.lower().split() for d in docs])
 
 # =========================
-# BM25 INDEX
-# =========================
-tokenized_docs = [d.page_content.lower().split() for d in docs]
-bm25 = BM25Okapi(tokenized_docs)
-
-# =========================
-# USER QUERY
+# QUERY
 # =========================
 query = "CAN SOMEONE MAKE PRIVATE ARMY?"
 
-# =========================
-# PIPELINE
-# =========================
-rewritten_query = rewrite_query(query)
-intent = classify_intent(rewritten_query)
-
-print("\nINTENT:", intent)
-
-vector_results, bm25_results, expanded_query = route_query(
-    intent,
-    rewritten_query,
-    vector_store,
-    docs,
-    bm25
-)
-
-print("\nEXPANDED QUERY:", expanded_query)
+rewritten = rewrite_query(query)
+intent = classify_intent(rewritten)
 
 # =========================
 # RETRIEVAL
 # =========================
-final_docs = hybrid_retrieval(vector_results, bm25_results)
+v_docs, b_docs, expanded = route_query(intent, rewritten, vector_store, docs, bm25)
+final_docs = hybrid_retrieval(v_docs, b_docs)
 
-# =========================
-# CONTEXT
-# =========================
 context = build_context(final_docs)
 
 # =========================
-# PROMPT
+# GENERATION
 # =========================
 prompt = f"""
 You are a strict legal AI assistant.
 
-RULES:
-- Use only context
-- Do not hallucinate
-- Be precise
+Use ONLY context.
+No hallucination.
 
 CONTEXT:
 {context}
@@ -235,32 +229,39 @@ QUESTION:
 {query}
 """
 
-# =========================
-# LLM RESPONSE
-# =========================
-response = llm.invoke(prompt)
-answer = response.content
+answer = llm.invoke(prompt).content
 
 # =========================
-# VALIDATION (STEP 44 + 45)
+# STEP 44 + 45 + 46
 # =========================
-is_hallucinated, keyword_score = detect_hallucination(answer, final_docs)
-is_grounded, semantic_score = semantic_grounding(answer, final_docs, embedding_model)
+kw = keyword_check(answer, final_docs)
+sem = semantic_check(answer, final_docs, embedding_model)
+confidence = compute_confidence(kw, sem, final_docs)
 
-print("\nVALIDATION:")
-print("Keyword Score:", round(keyword_score, 3))
-print("Semantic Score:", round(semantic_score, 3))
+print("\n--- SCORES ---")
+print("Keyword:", round(kw, 3))
+print("Semantic:", round(sem, 3))
+print("Confidence:", confidence)
 
 # =========================
-# FINAL DECISION
+# DECISION LAYER
 # =========================
-if is_hallucinated or not is_grounded:
+if confidence < 0.5:
+    print("\n⚠️ LOW CONFIDENCE")
+    final_output = "Insufficient verified information in documents."
 
-    print("\n⚠️ ANSWER NOT RELIABLE\n")
-
-    print("SAFE RESPONSE:\n")
-    print("The retrieved documents do not provide sufficient verified information.")
+elif confidence < 0.75:
+    print("\n⚠️ MEDIUM CONFIDENCE")
+    final_output = answer
 
 else:
-    print("\nFINAL ANSWER:\n")
-    print(answer)
+    print("\n✅ HIGH CONFIDENCE")
+    final_output = answer
+
+# =========================
+# STEP 47 — STRUCTURED OUTPUT
+# =========================
+structured_output = format_answer_with_citations(final_output, final_docs)
+
+print("\n--- FINAL STRUCTURED OUTPUT ---\n")
+print(structured_output)
